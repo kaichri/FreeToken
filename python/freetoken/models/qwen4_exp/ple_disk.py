@@ -100,6 +100,49 @@ def resolve_row_source(folder: str) -> PleRowSource:
     return source_from_safetensors(folder)
 
 
+class _CppStore:
+    """Tensor-facing wrapper over the C++ ``PleStore`` (same three ops, no raw pointers here)."""
+
+    def __init__(self, cpp, kwargs: dict) -> None:
+        self._cpp = cpp(**kwargs)
+
+    def io_backend(self) -> str:
+        return self._cpp.io_backend()
+
+    def stage(self, run: torch.Tensor, dst: torch.Tensor) -> None:
+        self._cpp.stage(run.data_ptr(), run.numel() - 2, dst.data_ptr())
+
+    def flush(self, flag: torch.Tensor | None) -> None:
+        self._cpp.flush(flag.data_ptr() if flag is not None else 0)
+
+
+def make_row_store(source: PleRowSource, hash_constants: dict) -> tuple[object, bool]:
+    """The row store for this platform plus whether it supports the graph flag protocol.
+
+    The extension is Linux-only; elsewhere the Python store runs, and because it reads
+    synchronously on the host it must use launch-gating rather than the memop flag sync.
+    """
+    kwargs = dict(
+        paths=list(source.paths),
+        extent_file=list(source.extent_file),
+        extent_base=list(source.extent_base),
+        rows_per_extent=source.rows_per_extent,
+        row_bytes=source.row_bytes,
+        row_stride=source.row_stride,
+        multipliers=[int(x) for x in hash_constants["layer_multipliers"]],
+        head_vocab_sizes=[int(x) for x in hash_constants["per_head_vocab_sizes"]],
+        head_offsets=[int(x) for x in hash_constants["per_head_offsets"]],
+        eos_token_id=int(hash_constants["eos_token_id"]),
+    )
+    try:
+        from freetoken.kernel.row_store import PleStore
+    except ImportError:
+        from .ple_disk_py import PyPleStore
+
+        return PyPleStore(use_io_uring=False, **kwargs), False
+    return _CppStore(PleStore, {**kwargs, "use_io_uring": os.getenv(_IO_URING_ENV, "1") != "0"}), True
+
+
 class DiskRowTable:
     """``PLETableBackend`` whose rows are read from disk per fill (--ple-backend disk)."""
 
@@ -112,8 +155,6 @@ class DiskRowTable:
         max_extend_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        from freetoken.kernel.row_store import PleStore
-
         self.num_rows = source.total_rows
         self.head_dim = source.row_bytes  # fp8: one byte per element
         self.dtype = dtype
@@ -128,19 +169,7 @@ class DiskRowTable:
             raise ValueError(
                 f"PLE row source holds {source.total_rows} rows but the hash addresses {need}; incomplete checkpoint?"
             )
-        self._store = PleStore(
-            paths=list(source.paths),
-            extent_file=list(source.extent_file),
-            extent_base=list(source.extent_base),
-            rows_per_extent=source.rows_per_extent,
-            row_bytes=source.row_bytes,
-            row_stride=source.row_stride,
-            multipliers=[int(x) for x in hash_constants["layer_multipliers"]],
-            head_vocab_sizes=sizes,
-            head_offsets=offsets,
-            eos_token_id=self.eos_token_id,
-            use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
-        )
+        self._store, flag_sync = make_row_store(source, hash_constants)
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._token_bytes = self.heads * self.head_dim
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
@@ -155,9 +184,13 @@ class DiskRowTable:
         self._eager_pinned.zero_()  # the warmup prefill stages nothing and reads whatever sits here
         self._eager_dev = torch.empty(eager_bytes, dtype=torch.uint8, device=self._device)
         # probe picks flag-sync (graph WAITs at the consume, host fills then signals) or launch-gating
-        from freetoken.kernel.row_store import probe_wait_sync
+        if flag_sync:
+            from freetoken.kernel.row_store import probe_wait_sync
 
-        self._wait_sync = probe_wait_sync(os.getenv(_SYNC_ENV, "auto"), self._device)
+            self._wait_sync = probe_wait_sync(os.getenv(_SYNC_ENV, "auto"), self._device)
+        else:
+            # a synchronous host store is already filled before the forward is enqueued
+            self._wait_sync = False
         # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
         self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
         self._flag.zero_()
@@ -173,9 +206,12 @@ class DiskRowTable:
         pinned = self._graph_pinned if graph else self._eager_pinned
         offset = 0
         for run in runs:
-            self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
-            offset += run.numel() - 2
-        self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
+            count = run.numel() - 2
+            self._store.stage(
+                run, pinned[offset * self._token_bytes : (offset + count) * self._token_bytes]
+            )
+            offset += count
+        self._store.flush(self._flag if graph and self._wait_sync else None)
 
     def _ple_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.image_token_id is None:
