@@ -713,12 +713,17 @@ class SpeculativeRoundDriver:
         Row ``t`` is the token at position ``t`` against the residual of ``t-1``, the Phase-0
         prober's ``prime``; hence the ``t >= 1`` floor, and hence ``target_residual`` being the
         tail shifted by one row relative to the tokens.
+
+        Returns 0 on an engine built without the head, so the same driver can serve the MTP-off
+        side of an A/B: the plain path never drafts, so there is nothing to prime for.
         """
         from freetoken.models.blocks import embed_input_ids
 
         engine = self.engine
         head = engine.model.mtp
-        assert head is not None, "the engine was built without --enable-mtp"
+        if head is None or head._kv is None:
+            self._primed_rows = 0
+            return 0
         kv = head.ensure_kv(self._window_slots(), device=engine.device, dtype=engine.dtype)
         lo = max(1, prompt_len - (kv.window - 1) + 1)
         count = prompt_len - lo + 1
