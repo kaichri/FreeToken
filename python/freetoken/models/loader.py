@@ -73,14 +73,9 @@ def safetensors_weight_map(folder: str) -> dict[str, str]:
 
 def drop_page_cache(path: str) -> None:
     """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM)."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
+    from freetoken.utils.misc import drop_file_cache
+
+    drop_file_cache(path)
 
 
 def iter_root_safetensor_files_from_index(

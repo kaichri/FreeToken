@@ -107,12 +107,9 @@ def iter_expert_tensors_parallel(
             for shard in shard_list:
                 path = os.path.join(model_path, shard)
                 if drop_cache:
-                    try:
-                        fd = os.open(path, os.O_RDONLY)
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                        os.close(fd)
-                    except OSError:
-                        pass
+                    from freetoken.utils.misc import drop_file_cache
+
+                    drop_file_cache(path)
                 buf = _read_shard_odirect_parallel(path, workers, chunk)  # overlaps placement
                 n = struct.unpack("<Q", bytes(buf[:8]))[0]
                 hdr = json.loads(bytes(buf[8:8 + n]))

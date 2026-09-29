@@ -1,5 +1,27 @@
 from __future__ import annotations
 
+import os
+
+
+def drop_file_cache(path: str, offset: int = 0, nbytes: int = 0) -> None:
+    """Best-effort POSIX_FADV_DONTNEED on ``path[offset : offset + nbytes]`` (whole file when nbytes=0).
+
+    Host RAM cannot hold the expert banks and the checkpoint page cache at once, so
+    loaded ranges are dropped to keep the banks resident. A no-op where the platform
+    has no posix_fadvise (Windows) and on any OSError -- it is an optimisation.
+    """
+    fadvise = getattr(os, "posix_fadvise", None)
+    if fadvise is None:
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            fadvise(fd, offset, nbytes, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
 
 def call_if_main(name: str = "__main__", discard: bool | None = None):
     """Decorator to ensure a function will call when the script is run as main."""

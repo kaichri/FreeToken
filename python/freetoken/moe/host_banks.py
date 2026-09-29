@@ -385,12 +385,9 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
     (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
     size = os.path.getsize(path)
     if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, 0, 0, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
+        from freetoken.utils.misc import drop_file_cache
+
+        drop_file_cache(path)
     mv = buf if isinstance(buf, memoryview) else memoryview(buf)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
     offs = list(range(0, size, chunk))
@@ -436,12 +433,9 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
         raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
     if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, file_offset, nbytes, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
+        from freetoken.utils.misc import drop_file_cache
+
+        drop_file_cache(path, file_offset, nbytes)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
     scratch = threading.local()
 
