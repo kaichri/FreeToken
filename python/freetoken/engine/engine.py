@@ -1041,6 +1041,25 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
+    def forward_verify(self, batch: Batch) -> torch.Tensor:
+        """The speculative target forward: a varlen extend of k+1 tokens per request.
+
+        Returns the [bs, vocab] logits for the LAST token of each request's chunk, i.e. the
+        distribution the drafted token is checked against. Deliberately unlike
+        ``forward_batch``: it does not call ``complete_one`` (the chunk advanced more than
+        one token, so the request must not be advanced here) and it does not sample or
+        publish a token. CUDA graphs are never used for this shape.
+        """
+        assert torch.cuda.current_stream() == self.stream
+        assert batch.is_verify
+        assert not self.graph_runner.can_use_cuda_graph(batch)
+        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
+            logits = self.model.forward()
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.raise_if_unhealthy()
+        return logits[: batch.size]
+
+    @torch.inference_mode()
     def _warmup_prefill(self) -> None:
         """Compile the Triton prefill path before the first real request.
 

@@ -106,7 +106,7 @@ class MoELayer(BaseOP):
         assert self.quant_method is not None
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
-            layer=self, is_prefill=get_global_ctx().batch.is_prefill,
+            layer=self, is_prefill=not get_global_ctx().batch.is_decode,
         )
 
     def routed_forward(
@@ -195,7 +195,9 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        # not is_decode, not is_prefill: a verify chunk is multi-token per request and needs
+        # the varlen expert kernels, but it is not a prefill.
+        if not ctx.batch.is_decode:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
@@ -218,7 +220,7 @@ class OffloadMoELayer(MoELayer):
         shared branches that need the original input before calling this method.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if not ctx.batch.is_decode:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)

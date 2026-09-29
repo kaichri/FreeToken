@@ -112,7 +112,10 @@ class Req:
 @dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode"]
+    # "verify" is the speculative target forward: k+1 tokens per request in one varlen
+    # extend. It takes every varlen path (it is not is_decode) but is not a prefill, so it
+    # commits no prefix cache and admits no prompt.
+    phase: Literal["prefill", "decode", "verify"]
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
@@ -162,6 +165,10 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    @property
+    def is_verify(self) -> bool:
+        return self.phase == "verify"
 
     def get_attn_positions(self) -> torch.Tensor:
         return self.mrope_positions if self.mrope_positions is not None else self.positions

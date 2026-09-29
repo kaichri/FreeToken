@@ -126,7 +126,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if batch.is_prefill:
+        if not batch.is_decode:
+            # varlen: one row per request, the last token of its chunk. For a verify chunk
+            # that is the drafted token's row, which is the distribution the draft is
+            # checked against.
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
