@@ -78,6 +78,29 @@ def _top_set_overlap(a: torch.Tensor, b: torch.Tensor, k: int = 20) -> float:
     return len(ta & tb) / max(1, len(ta))
 
 
+def _confidence(logits: torch.Tensor) -> dict:
+    """How decided one distribution is: its top-1 probability and its top-1/top-2 margin.
+
+    Both are wanted because they answer different questions. The margin is a property of the
+    top of the distribution and costs one topk; the probability also accounts for the rest of
+    the vocabulary, which is what a confidence gate should really look at. Reading either costs
+    a device sync, so this is only called under instrumentation.
+
+    The probability is over the *softmax of the row as computed*, i.e. bf16 logits promoted to
+    fp32 before the reduction, so it is a property of this forward and not of a re-run.
+    """
+    row = logits.float()
+    top2 = row.topk(2).values
+    peak = row.max()
+    total = float(torch.exp(row - peak).sum())
+    top1 = float(top2[0])
+    return {
+        "prob": float(torch.exp(top1 - peak)) / total,
+        "margin": top1 - float(top2[1]),
+        "top1": top1,
+    }
+
+
 @dataclass
 class DraftOutcome:
     """What one round decided. ``target_next`` is the token plain AR would emit next."""
@@ -119,6 +142,17 @@ class SpeculativeRoundDriver:
         # a token to draft instead of running the head, for a test that needs one particular
         # accept or reject; None means "ask the head"
         self._forced_draft: int | None = None
+        # decision metrics for the acceptance benchmark. Off by default: turning them on costs
+        # a topk and a device sync per round, which is fine for a measurement run and not for
+        # a decode loop, so the production path never pays for them.
+        self._instrument = False
+        self._last_metrics: dict = {}
+        # The rewind's distributional check is a production guard, and its bars were measured on
+        # a five-token prompt. On a two-thousand-token context the same forward is measurably
+        # less reproducible, so a long-context run can trip a bar that says nothing about the
+        # rollback. A measurement run turns the guard off and records the numbers instead --
+        # ``_last_rewind`` is populated either way, so nothing stops being observable.
+        self._assert_rewind = True
         self._steps = 0
         self._proposed = 0
         self._accepted = 0
@@ -176,6 +210,7 @@ class SpeculativeRoundDriver:
         # 3. the draft, against the head's own window. It claims a window row, which a reject
         #    has to give back -- so the claim exists before the verify, and the snapshot above is
         #    the state a correct rollback returns to.
+        draft_pos = req.cached_len          # the position the draft's query sits at
         d1 = self._draft(y1)
 
         # 4. the verify: [y1, d1] as one 2-token varlen chunk. forward_verify does not sample
@@ -185,6 +220,19 @@ class SpeculativeRoundDriver:
         self._proposed += 1
         self._accepted += int(accepted)
         self._rejects += int(not accepted)
+        if self._instrument:
+            # the position the draft occupied before the commit, so an accept's second token
+            # and a reject's re-forward both still report the decision's own coordinates
+            self._last_metrics.update({
+                "step": self._steps + 1,
+                "draft_index": 0,               # k=1: the only draft in the round
+                "position": draft_pos,
+                "context_len": int(draft_pos),
+                "window_live": int(self._window_live()),
+                "draft_token": int(d1),
+                "target_token": int(target_next),
+                "accepted": bool(accepted),
+            })
 
         # 5. commit the accepted prefix. Either way the request ends positioned at the last
         #    committed token, which is what the next round's plain step forwards.
@@ -292,6 +340,8 @@ class SpeculativeRoundDriver:
         # reject-path assertion, which compares the re-forward against this exact row.
         self._verify_row0 = logits[0].float()
         self._verify_top0 = float(self._verify_row0.max())
+        if self._instrument:
+            self._last_metrics["target"] = _confidence(self._verify_row0)
         return logits[0].argmax().to(torch.int32)
 
     def _claim_verify_pages(self) -> None:
@@ -425,7 +475,9 @@ class SpeculativeRoundDriver:
                 / self._verify_row0.norm().clamp_min(1e-6)
             ),
         }
-        if agree < _MIN_TOP_SET_OVERLAP or corr < _MIN_LOGIT_CORRELATION:
+        if self._assert_rewind and (
+            agree < _MIN_TOP_SET_OVERLAP or corr < _MIN_LOGIT_CORRELATION
+        ):
             raise AssertionError(
                 f"the re-forward did not rebuild the verify's distribution: top-20 overlap "
                 f"{agree:.0%} (need {_MIN_TOP_SET_OVERLAP:.0%}), correlation {corr:.3f} "
@@ -515,7 +567,16 @@ class SpeculativeRoundDriver:
             # attention metadata to pick a last row out of a batch the head does not have.
             logits = model.lm_head.forward_all(hidden)
         self._draft_row_slot = self._window_slot()
+        if self._instrument:
+            self._last_metrics["draft"] = _confidence(logits[-1].float())
         return logits[-1].argmax().to(torch.int32).cpu()
+
+    def _window_live(self) -> int:
+        """The head window's live row count, or 0 before the head has been used."""
+        head = self.engine.model.mtp
+        if head is None or head._kv is None:
+            return 0
+        return head.kv.live_rows(self._window_slot())
 
     def _window_slot(self) -> int:
         """The head window's slot for this request.

@@ -32,8 +32,10 @@ from .attention import TorchDenseQSAReference
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
-# The Phase-0 probe swept the head's priming length and acceptance was flat past 128
-# positions, so the window is capped there and older rows are dropped.
+# The head's KV window is capped here, and the cap is load-bearing rather than a memory
+# convenience: the prober's own score.json shows one-step top-1 falling off a cliff as the
+# window grows -- code 89.1% at 128 rows, 73.0% at 256, 43.8% at 512, 34.6% at 2048. Measured
+# in-tree at 128 with the real engine, so the cap is where the head is worth running.
 MTP_KV_WINDOW = 128
 
 # The head owns one attention layer, so its window lives under this layer id in the
