@@ -23,7 +23,15 @@ from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import (
+    align_ceil,
+    div_ceil,
+    init_logger,
+    is_sm90_family,
+    is_sm100_family,
+    mem_GB,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -592,6 +600,10 @@ class Engine:
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
+
+        With the MTP head enabled this also holds back what the head needs at runtime. The
+        head's own tensors need no special case: they are inside ``self._weights_bytes``,
+        which is measured rather than declared.
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
 
@@ -599,19 +611,90 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        return resolve_moe_cache_auto(
-            baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes,
-            memory_ratio=config.memory_ratio,
-            cache_per_page=cache_per_page,
-            fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
-            num_experts=num_experts,
-            total_experts=total_experts,
-            prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
-            page_size=page_tokens,
-            max_slots=method.slot_limit() if method is not None else None,
+        per_expert_bytes = expert_bytes_per_slot(banks.sources)
+        reserve = self._mtp_budget_reserve(config)
+        if reserve["total"]:
+            self._log_moe_cache_budget(config, per_expert_bytes, reserve, len(banks.sources))
+        try:
+            return resolve_moe_cache_auto(
+                baseline_free=self._baseline_free,
+                weights_bytes=self._weights_bytes,
+                memory_ratio=config.memory_ratio,
+                cache_per_page=cache_per_page,
+                fixed_cache_size=fixed_cache_size,
+                per_expert_bytes=per_expert_bytes,
+                num_experts=num_experts,
+                total_experts=total_experts,
+                prefill_overlap=config.moe_prefill_overlap,
+                kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+                page_size=page_tokens,
+                max_slots=method.slot_limit() if method is not None else None,
+                reserve_bytes=reserve["total"],
+            )
+        except AssertionError as exc:
+            # fail here, in arithmetic, rather than at the first CUDA allocation
+            if not reserve["total"]:
+                raise
+            raise AssertionError(
+                f"{exc} -- the MTP runtime reserve holds back "
+                f"{reserve['total'] / 2**30:.2f} GiB "
+                f"(snapshot {reserve['snapshot_slot_bytes'] / 2**20:.0f} MiB, window "
+                f"{reserve['window_bytes'] / 2**20:.0f} MiB, safety "
+                f"{reserve['safety_bytes'] / 2**30:.2f} GiB); lower --mtp-kv-window, cap "
+                "--max-running-reqs, raise --memory-ratio, or run without --enable-mtp"
+            ) from exc
+
+    def _mtp_budget_reserve(self, config: EngineConfig) -> dict:
+        """What the MTP path needs beyond its own weights. Zero when the head is off."""
+        from freetoken.engine.cache_budget import mtp_budget_reserve
+
+        head = getattr(getattr(self, "model", None), "mtp", None)
+        if head is None or not bool(getattr(config, "enable_mtp", False)):
+            return {"total": 0}
+        from freetoken.kvcache.linear_state_pool import linear_state_bytes_per_req
+
+        group = config.model_config.linear_attention_group()
+        slot_bytes = (
+            linear_state_bytes_per_req(
+                group, config.tp_info.size, config.dtype,
+                getattr(config.model_config, "slot_states", ()),
+            )
+            if group is not None else 0
+        )
+        from freetoken.models.qwen4_exp.mtp_kv import window_bytes_per_request
+
+        window_bytes = window_bytes_per_request(
+            config.model_config, itemsize=self.dtype.itemsize
+        )
+        return mtp_budget_reserve(
+            mtp_enabled=True,
+            linear_slot_bytes=slot_bytes,
+            window_bytes_per_request=window_bytes,
+            max_running_reqs=config.max_running_req,
+        )
+
+    def _log_moe_cache_budget(self, config, per_expert_bytes, reserve, bank_count: int) -> None:
+        """The full startup breakdown, so a slot count is never a number without a reason.
+
+        The head's own residency does not appear as its own line because it has none: it is
+        inside ``_weights_bytes``, which is measured as free-memory-after-weights, so the
+        number moves when the head is built and needs no separate declaration to stay honest.
+        """
+        from freetoken.cache_report import format_bytes
+
+        total_vram = self._sync_get_memory()[1]
+        logger.info(
+            "moe cache auto-sizing with the mtp head resident:\n"
+            "  total VRAM                            %s\n"
+            "  pre-model baseline free               %s\n"
+            "  weights resident (incl. the mtp head) %s\n"
+            "  mtp runtime reserve                   %s "
+            "(snapshot %s, window %s, safety %s)\n"
+            "  bytes per expert slot                 %d over %d bank sources",
+            format_bytes(total_vram), format_bytes(self._baseline_free),
+            format_bytes(self._weights_bytes), format_bytes(reserve["total"]),
+            format_bytes(reserve["snapshot_slot_bytes"]), format_bytes(reserve["window_bytes"]),
+            format_bytes(reserve["safety_bytes"]), per_expert_bytes, bank_count,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:

@@ -13,6 +13,13 @@ from freetoken.utils import div_ceil
 if TYPE_CHECKING:
     import torch
 
+# What the MTP path holds back from the expert cache, on top of its own measured weights.
+# 0.75 GiB: measured as the head's window plus a snapshot slot is ~0.13 GiB, and the window is
+# allocated lazily on the first draft, so the reserve has to cover a late allocation as well as
+# the expert cache's own fragmentation. An OOM at the first draft would be a far worse place to
+# discover that than at startup.
+MTP_SAFETY_BYTES = 768 * 1024 * 1024
+
 
 def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     """Bytes one expert slot occupies on GPU: summed row bytes over all banks.
@@ -95,6 +102,44 @@ def plan_cache_budget(
     return moe_cache_size, num_pages, overlap
 
 
+def mtp_budget_reserve(
+    *,
+    mtp_enabled: bool,
+    linear_slot_bytes: int,
+    window_bytes_per_request: int,
+    max_running_reqs: int,
+    snapshot_slots: int = 1,
+    safety_bytes: int = MTP_SAFETY_BYTES,
+) -> dict:
+    """Bytes the MTP path needs on top of the model's own weights, with the breakdown.
+
+    The head's own tensors are already inside ``weights_bytes``: the engine measures that as
+    free-memory-after-weights, so the 4.9 GiB head is charged without anybody declaring it.
+    What is NOT in there is everything the head needs *at runtime*, which is allocated after
+    auto-sizing has run:
+
+    * the linear-state snapshot slot the round rewinds into. One per concurrently
+      speculating request; the driver holds its slot for its life rather than per step.
+    * the head's bounded KV window, one window per request slot.
+    * a safety reserve. The window is built on first draft and the expert cache's own
+      fragmentation is not knowable here, so the last thing to do is size the expert cache
+      down to the byte and discover the shortfall as a CUDA OOM.
+
+    Returns ``total = 0`` and an empty breakdown when MTP is off, so the budget for a run
+    without the head is arithmetically identical to what it was before this existed.
+    """
+    if not mtp_enabled:
+        return {"total": 0}
+    snapshot = snapshot_slots * linear_slot_bytes
+    window = window_bytes_per_request * max_running_reqs
+    return {
+        "snapshot_slot_bytes": snapshot,
+        "window_bytes": window,
+        "safety_bytes": safety_bytes,
+        "total": snapshot + window + safety_bytes,
+    }
+
+
 def resolve_moe_cache_auto(
     *,
     baseline_free: int,
@@ -109,6 +154,7 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    reserve_bytes: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -117,8 +163,15 @@ def resolve_moe_cache_auto(
     Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
     the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
     CUDA-graph/activation headroom (not subtracted here).
+
+    ``reserve_bytes`` is held back before the split, for allocations that happen after this
+    runs -- the MTP head's window and snapshot slot, see :func:`mtp_budget_reserve`. It is 0
+    for every run without the head, so their budget is unchanged.
     """
-    budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
+    budget_bytes = (
+        net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
+        - reserve_bytes
+    )
     max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
     return plan_cache_budget(

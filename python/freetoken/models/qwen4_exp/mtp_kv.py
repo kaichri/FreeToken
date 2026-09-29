@@ -233,4 +233,25 @@ class MtpKV:
         self._live = [0] * self.num_slots
 
 
-__all__ = ["MTP_KV_WINDOW", "MTP_LAYER_ID", "MtpDraftBatch", "MtpKV", "MtpWindowReq"]
+def window_bytes_per_request(
+    config: ModelConfig, *, window: int = MTP_KV_WINDOW, itemsize: int = 2
+) -> int:
+    """Device bytes one request's window holds, from the config rather than a live pool.
+
+    The engine has to budget for the window before any request exists, so the figure cannot
+    come from :meth:`MtpKV.bytes_per_slot` -- that needs an allocated cache. The head's single
+    attention layer has the trunk's head geometry, so K and V over ``window`` positions is the
+    whole cost.
+    """
+    per_row = config.num_kv_heads * config.head_dim * 2 * itemsize   # K and V
+    return window * per_row
+
+
+__all__ = [
+    "MTP_KV_WINDOW",
+    "MTP_LAYER_ID",
+    "MtpDraftBatch",
+    "MtpKV",
+    "MtpWindowReq",
+    "window_bytes_per_request",
+]

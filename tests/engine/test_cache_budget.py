@@ -7,7 +7,13 @@ import torch
 
 import os
 
-from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import (
+    MTP_SAFETY_BYTES,
+    expert_bytes_per_slot,
+    mtp_budget_reserve,
+    plan_cache_budget,
+    resolve_moe_cache_auto,
+)
 from freetoken.engine.engine import _pin_budget_bytes
 
 
@@ -120,6 +126,82 @@ def test_resolve_auto_caps_slots_at_the_kernel_limit():
         kv_reserve_tokens=0, page_size=1, max_slots=992,
     )
     assert size == 992
+
+
+# ------------------------------------------------------------------ mtp runtime reserve
+
+
+def test_mtp_reserve_is_zero_without_the_head():
+    """Without the head the budget must be arithmetically what it was before MTP existed."""
+    assert mtp_budget_reserve(
+        mtp_enabled=False, linear_slot_bytes=1 << 30, window_bytes_per_request=1 << 20,
+        max_running_reqs=64,
+    ) == {"total": 0}
+
+
+def test_mtp_reserve_sums_the_runtime_pieces():
+    reserve = mtp_budget_reserve(
+        mtp_enabled=True,
+        linear_slot_bytes=110 * 2**20,          # one measured GDN snapshot slot
+        window_bytes_per_request=256 * 2**10,   # one 128-row window
+        max_running_reqs=8,
+        safety_bytes=MTP_SAFETY_BYTES,
+    )
+    assert reserve["snapshot_slot_bytes"] == 110 * 2**20
+    assert reserve["window_bytes"] == 8 * 256 * 2**10
+    assert reserve["safety_bytes"] == MTP_SAFETY_BYTES
+    assert reserve["total"] == (
+        reserve["snapshot_slot_bytes"] + reserve["window_bytes"] + reserve["safety_bytes"]
+    )
+
+
+def test_mtp_safety_reserve_is_at_least_half_a_gibibyte():
+    assert MTP_SAFETY_BYTES >= 512 * 2**20
+    assert MTP_SAFETY_BYTES <= 1024 * 2**20, "past 1 GiB the reserve costs more than it protects"
+
+
+def test_mtp_reserve_shrinks_the_expert_cache_by_its_own_size():
+    """The reserve must come out of the expert cache, in slots, and by the real slot size."""
+    common = dict(
+        memory_ratio=1.0, cache_per_page=10, fixed_cache_size=0, per_expert_bytes=100,
+        num_experts=4, total_experts=100_000, prefill_overlap=False,
+        kv_reserve_tokens=1000, page_size=1,
+    )
+    reserve = mtp_budget_reserve(
+        mtp_enabled=True, linear_slot_bytes=0, window_bytes_per_request=0,
+        max_running_reqs=1, safety_bytes=10_000,
+    )
+    # 1_000_000 bytes, 10_000 of it reserved for KV, leaves 990_000 -> 9_900 expert slots,
+    # well under the cap so the plan is budget-driven and a reserve can actually move it
+    without, _, _ = resolve_moe_cache_auto(baseline_free=1_000_000, weights_bytes=0, **common)
+    with_mtp, _, _ = resolve_moe_cache_auto(
+        baseline_free=1_000_000, weights_bytes=0, reserve_bytes=reserve["total"], **common
+    )
+    assert without == 9_900
+    assert without - with_mtp == 100          # 10_000 bytes of reserve at 100 B per slot
+
+
+def test_mtp_budget_below_the_minimum_fails_in_arithmetic_not_oom():
+    """A budget too small even for the floor must raise here, not at a later CUDA allocation."""
+    with pytest.raises(AssertionError):
+        resolve_moe_cache_auto(
+            baseline_free=100, weights_bytes=0, memory_ratio=1.0,
+            cache_per_page=10, fixed_cache_size=0, per_expert_bytes=100,
+            num_experts=4, total_experts=8, prefill_overlap=True,
+            kv_reserve_tokens=0, page_size=1,
+        )
+
+
+def test_window_bytes_follow_the_window_and_the_head_geometry():
+    from freetoken.models.qwen4_exp.mtp_kv import MTP_KV_WINDOW, window_bytes_per_request
+
+    config = SimpleNamespace(num_kv_heads=2, head_dim=64)
+    one = window_bytes_per_request(config, window=8, itemsize=2)
+    two = window_bytes_per_request(config, window=16, itemsize=2)
+    assert two == 2 * one
+    # K and V over window * num_kv * head_dim
+    assert one == 8 * 2 * 64 * 2 * 2
+    assert window_bytes_per_request(config) == MTP_KV_WINDOW * 2 * 64 * 2 * 2
 
 
 def _dsv4_adjust_cfg(**over):
