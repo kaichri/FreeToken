@@ -259,8 +259,13 @@ def _load_prebuilt(name: str) -> Module | None:
             )
         return None
 
-    so_path = cache_dir / name / f"{name}.so"
-    if so_path.exists():
+    # the cache wheel ships .so on Linux and .dll on Windows; probing only the former
+    # made every kernel miss the cache and fall through to JIT
+    so_path = next(
+        (p for p in (cache_dir / name / f"{name}.so", cache_dir / name / f"{name}.dll") if p.exists()),
+        None,
+    )
+    if so_path is not None:
         import tvm_ffi
 
         return tvm_ffi.load_module(str(so_path))
@@ -268,7 +273,7 @@ def _load_prebuilt(name: str) -> Module | None:
     if _env_enabled(DISABLE_JIT_ENV):
         raise RuntimeError(
             "JIT compilation is disabled by FREETOKEN_DISABLE_JIT, "
-            f"but prebuilt kernel {name!r} was not found at {so_path}"
+            f"but prebuilt kernel {name!r} was not found under {cache_dir / name}"
         )
     return None
 
