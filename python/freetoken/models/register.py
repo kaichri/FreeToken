@@ -32,6 +32,9 @@ class ModelSpec:
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
+    # checkpoint key prefix of a multi-token-prediction head; None: the family has none.
+    # load_weight drops these unless the engine built the head (--enable-mtp).
+    mtp_key_prefix: str | None = None
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -189,6 +192,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        mtp_key_prefix="mtp.",
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the

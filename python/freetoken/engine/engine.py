@@ -549,6 +549,7 @@ class Engine:
                 self.device,
                 include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
                 include_vision=bool(config.active_encoders),
+                include_mtp=config.enable_mtp,
             ),
             device=self.device,
         )

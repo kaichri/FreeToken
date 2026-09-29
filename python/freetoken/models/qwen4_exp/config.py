@@ -43,6 +43,11 @@ class Qwen4ExpArgs:
     index_budget: int
     index_ratio: int
     image_token_id: int | None = None
+    # MTP draft head (Qwen3.8 ships one full_attention layer; mtp.* is BF16, see the
+    # checkpoint's quantization_config.ignore). 0 when the checkpoint has no head, or when
+    # the head exists but the model was built without it.
+    mtp_num_hidden_layers: int = 0
+    mtp_layer_types: Tuple[str, ...] = ()
 
     @property
     def index_topk_blocks(self) -> int:
@@ -110,6 +115,22 @@ def _layer_types(text: Any) -> list[str]:
         "full_attention" if (i + 1) % interval == 0 else "linear_attention"
         for i in range(n)
     ]
+
+
+def _mtp_layers(text: Any) -> Tuple[int, Tuple[str, ...]]:
+    """The MTP head's layer count and layer types (``text_config.mtp``), (0, ()) when absent.
+
+    ``mtp`` is a plain dict in Qwen3.8's config.json, and a nested config object in a
+    transformers release that knows the architecture, so read it either way.
+    """
+    head = getattr(text, "mtp", None)
+    if head is None:
+        return 0, ()
+    layer_types = head.get("layer_types") if isinstance(head, dict) else getattr(head, "layer_types", None)
+    count = getattr(text, "mtp_num_hidden_layers", None)
+    if count is None:
+        count = head.get("num_hidden_layers") if isinstance(head, dict) else getattr(head, "num_hidden_layers", None)
+    return int(count or 0), tuple(layer_types or ())
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -200,6 +221,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
     num_experts = int(getattr(text, "num_experts", 0) or 0)
+    mtp_num_hidden_layers, mtp_layer_types = _mtp_layers(text)
 
     # HF accepts int | list here and uses the first entry (modeling_qwen4_exp Qwen4ExpTextNGramEmbedding)
     eos_token_id = text.eos_token_id
@@ -225,6 +247,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
         image_token_id=getattr(hf_config, "image_token_id", None),
+        mtp_num_hidden_layers=mtp_num_hidden_layers,
+        mtp_layer_types=mtp_layer_types,
     )
 
     return ModelConfig(

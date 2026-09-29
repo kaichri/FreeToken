@@ -23,6 +23,7 @@ from freetoken.models.qwen4_exp.weight import (
     load_ple_table,
 )
 from freetoken.models.register import get_model_spec
+from freetoken.models.weight import load_weight
 from freetoken.moe.host_banks import HostBank, read_range_into
 
 from .common import LM, RADIXARK_NVFP4, hf_config, install_quant_config, meta_state_dict, mixed_precision_quant
@@ -132,14 +133,43 @@ def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
         f"{attn}.indexer.q_layernorm.weight": _bf16(IHD),
         f"{attn}.indexer.k_layernorm.weight": _bf16(IHD),
     })
+    # The MTP head, the released 31-tensor set: 29 dense (fused down to 24 buffers by the
+    # reader) plus the two stacked BF16 expert tensors.
+    mtp = "mtp.layers.0"
     raw.update({
+        "mtp.fc_embedding.weight": _bf16(H, H),
+        "mtp.fc_hidden.weight": _bf16(H, H),
+        "mtp.pre_fc_norm_embedding.weight": _bf16(H),
+        "mtp.pre_fc_norm_hidden.weight": _bf16(HCH),
         "mtp.hyper_connection_mixer.hc_norm.weight": _bf16(HCH),
-        "mtp.layers.0.self_attn.q_proj.weight": _bf16(2 * QH * AHD, H),
-        "mtp.layers.0.mlp.experts.gate_up_proj": _bf16(E, 2 * I, H),
-        "mtp.layers.0.mlp.experts.down_proj": _bf16(E, H, I),
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight": _bf16(LR, HCH),
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight": _bf16(HCH, LR),
+        f"{mtp}.self_attn.q_proj.weight": _bf16(2 * QH * AHD, H),
+        f"{mtp}.self_attn.k_proj.weight": _bf16(KVH * AHD, H),
+        f"{mtp}.self_attn.v_proj.weight": _bf16(KVH * AHD, H),
+        f"{mtp}.self_attn.o_proj.weight": _bf16(H, QH * AHD),
+        f"{mtp}.self_attn.q_norm.weight": _bf16(AHD),
+        f"{mtp}.self_attn.k_norm.weight": _bf16(AHD),
+        f"{mtp}.self_attn.indexer.index_qk_proj.weight": _bf16(5 * IHD, H),
+        f"{mtp}.self_attn.indexer.q_layernorm.weight": _bf16(IHD),
+        f"{mtp}.self_attn.indexer.k_layernorm.weight": _bf16(IHD),
+        f"{mtp}.mlp.gate.weight": _bf16(E, H),
+        f"{mtp}.mlp.shared_expert_gate.weight": _bf16(1, H),
+        f"{mtp}.mlp.shared_expert.gate_proj.weight": _bf16(I, H),
+        f"{mtp}.mlp.shared_expert.up_proj.weight": _bf16(I, H),
+        f"{mtp}.mlp.shared_expert.down_proj.weight": _bf16(H, I),
+        f"{mtp}.mlp.experts.gate_up_proj": _bf16(E, 2 * I, H),
+        f"{mtp}.mlp.experts.down_proj": _bf16(E, H, I),
         "model.visual.blocks.0.attn.qkv.weight": _bf16(3 * H, H),
         "model.visual.merger.norm.weight": _bf16(H),
     })
+    for role in ("attn_hyper_connection", "mlp_hyper_connection"):
+        raw.update({
+            f"{mtp}.{role}.hc_norm.weight": _bf16(HCH),
+            f"{mtp}.{role}.input_mix_weight_down.weight": _bf16(LR, HCH),
+            f"{mtp}.{role}.input_mix_weight_up.weight": _bf16(HCH, LR),
+            f"{mtp}.{role}.block_inject_weight.weight": _bf16(HC, HCH),
+        })
     if dense_fp8:
         for module in (f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z", f"{gdn}.out_proj",
                        *(f"{attn}.{p}_proj" for p in "qkvo")):
@@ -203,6 +233,18 @@ def _load(folder: str, *, vision: bool = True) -> dict[str, torch.Tensor]:
     }
 
 
+def _load_generic(folder: str, *, include_mtp: bool, vision: bool = True) -> dict[str, torch.Tensor]:
+    """The generic loader's view, which is what decides whether the MTP head is read."""
+    install_quant_config(folder)
+    return {
+        name: tensor.clone()
+        for name, tensor in load_weight(
+            folder, torch.device("cpu"), include_moe_experts=True,
+            include_vision=vision, include_mtp=include_mtp,
+        )
+    }
+
+
 @pytest.fixture(scope="module")
 def checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
     torch.manual_seed(0)
@@ -231,12 +273,44 @@ def test_tower_keys_come_out_under_the_prefix_load_weight_filters(loaded):
     assert {n for n in loaded if "visual" in n} == {"visual.blocks.0.attn.qkv.weight", "visual.merger.norm.weight"}
 
 
-def test_mtp_experts_and_table_never_loaded(loaded):
+def test_mtp_head_is_read_but_not_from_the_trunk_expert_bank(loaded):
+    """The MTP head keeps its own prefix; only the per-expert trunk leaves and the table are dropped."""
+    mtp = {n for n in loaded if n.startswith("mtp.")}
+    assert {
+        "mtp.fc_embedding.weight",
+        "mtp.fc_hidden.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.hyper_connection_mixer.hc_norm.weight",
+        "mtp.layers.0.self_attn.qkv_proj.weight",           # q|k|v fused
+        "mtp.layers.0.mlp.experts.gate_up_proj",            # stacked, not per-expert
+        "mtp.layers.0.mlp.experts.down_proj",
+        "mtp.layers.0.mlp.shared_expert.gate_up_proj.weight",  # gate|up fused
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight",
+        "mtp.layers.0.mlp_hyper_connection.input_mix_weight_down_block_inject.weight",
+    } <= mtp
+    # the fused-away parts are gone, the per-expert trunk leaves and the table stay out
+    assert "mtp.layers.0.self_attn.q_proj.weight" not in loaded
+    assert "mtp.hyper_connection_mixer.input_mix_weight_down_block_inject.weight" not in loaded
     for name in loaded:
-        assert not name.startswith("mtp.")
-        assert ".mlp.experts." not in name
+        assert not (name.startswith("model.language_model.layers") and ".mlp.experts." in name)
         assert "ngram_embedding" not in name
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale", ".weight_scale_inv"))
+
+
+def test_generic_loader_gates_the_mtp_head(checkpoint):
+    """Without --enable-mtp the model has no module for these keys, so the loader must skip them."""
+    folder = checkpoint[0]
+    without = _load_generic(folder, include_mtp=False)
+    with_mtp = _load_generic(folder, include_mtp=True)
+    assert not {n for n in without if n.startswith("mtp.")}
+    assert {n for n in with_mtp if n.startswith("mtp.")} == {
+        n for n in _load(folder) if n.startswith("mtp.")
+    }
+    # the trunk is untouched either way
+    assert {n: v.shape for n, v in without.items() if not n.startswith("mtp.")} == {
+        n: v.shape for n, v in with_mtp.items() if not n.startswith("mtp.")
+    }
 
 
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):
@@ -457,12 +531,16 @@ FP8_MODULES = (
 )
 
 
+@pytest.mark.parametrize("enable_mtp", [False, True])
 @pytest.mark.parametrize("fixture", ["checkpoint", "checkpoint_nvfp4", "checkpoint_fp8"])
-def test_emitted_keys_are_the_model_state_dict(fixture, request):
+def test_emitted_keys_are_the_model_state_dict(fixture, request, enable_mtp):
     """The reader fills exactly the buffers the engine builds from the same config, block-fp8 ones with the stored dtypes."""
     folder, _raw = request.getfixturevalue(fixture)
-    loaded, state = _load(folder, vision=False), meta_state_dict(folder)
+    loaded = _load_generic(folder, include_mtp=enable_mtp, vision=False)
+    state = meta_state_dict(folder, enable_mtp=enable_mtp)
     assert set(loaded) == set(state)
+    if not enable_mtp:
+        assert not any(n.startswith("mtp.") for n in state)
     if fixture != "checkpoint_fp8":
         assert loaded["model.layers.0.linear_attn.in_proj.weight"].dtype is torch.bfloat16
         return

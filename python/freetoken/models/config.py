@@ -271,6 +271,10 @@ class ModelConfig:
     quant: Any | None = None
     # ----- optional, model-specific extensions (default keeps other models intact) -----
     moe_enabled: bool = False
+    # Build the checkpoint's MTP draft head. Off by default: it adds a full extra decoder
+    # layer's parameters (~4.7 GiB of BF16 experts on Qwen3.8) that nothing consumes until a
+    # speculative round exists. Set by EngineConfig from --enable-mtp.
+    mtp_enabled: bool = False
     # Weight quantization of the MoE experts only. "none" keeps the default BF16
     # offload/fused path; "nvfp4" stores experts as packed FP4 + block scales;
     # "fp8_block" is DeepSeek-V3-style 128x128 block-fp8 (weight fp8-e4m3 +

@@ -15,6 +15,7 @@ immediate combine::
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -26,6 +27,7 @@ from freetoken.utils import nvtx_annotate
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
+from .mtp import Qwen4ExpMTP
 from .ple import PLELayer
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
@@ -108,7 +110,12 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
-    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, batch: Batch) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(lm_head_input [T, hidden], pre_mixer_residual [T, hc_count*hidden])``.
+
+        The second value is the MTP head's input, so it is returned rather than
+        recomputed; with no MTP head built it is simply dropped by the caller.
+        """
         hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
         hidden = hidden.repeat(1, self.hc_count)
         meta = None
@@ -124,7 +131,13 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        return self.hyper_connection_mixer.mix(hidden)[0], hidden
+
+
+def _mtp_config(config: ModelConfig) -> ModelConfig:
+    """The head's own config: its experts are BF16 in the checkpoint while the trunk's are NVFP4,
+    so they cannot share the trunk's offload bank and are built resident instead."""
+    return replace(config, moe_strategy="fused")
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -139,6 +152,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        # Built only when the engine resolved the head AND asked for it, so a default
+        # engine has neither the parameters nor the ~4.7 GiB of BF16 experts.
+        self.mtp: Qwen4ExpMTP | None = None
+        if config.mtp_enabled and config.qwen4_args.mtp_num_hidden_layers > 0:
+            self.mtp = Qwen4ExpMTP(_mtp_config(config))
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
@@ -210,7 +228,21 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        collapsed, _pre_mixer = self.model.forward(batch.input_ids, batch)
+        return self.lm_head.forward(collapsed)
+
+    def mtp_logits(self, input_ids: torch.Tensor, pre_mixer_residual: torch.Tensor, batch: Batch) -> torch.Tensor:
+        """The MTP head's next-token logits, reusing the trunk's embedding and lm_head.
+
+        ``pre_mixer_residual`` is the ``[T, hc_count*hidden]`` value this model's forward
+        returned. Wiring this into a speculative round is the scheduler's job; Phase 1 only
+        makes the head constructible and loadable.
+        """
+        assert self.mtp is not None, "MTP head was not built (--enable-mtp)"
+        embedded = embed_input_ids(self.model.embed_tokens, input_ids, batch)
+        residual = self.mtp.fuse(embedded, pre_mixer_residual)
+        residual = self.mtp.layers.op_list[0].forward(residual, batch)
+        return self.lm_head.forward(self.mtp.logits(residual))
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

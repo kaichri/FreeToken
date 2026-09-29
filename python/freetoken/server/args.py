@@ -370,6 +370,25 @@ def parse_args(
         help="The number of tokenizer processes to launch. 0 means the tokenizer is shared with the detokenizer.",
     )
 
+    mtp_group = parser.add_argument_group("multi-token prediction (experimental)")
+    mtp_group.add_argument(
+        "--enable-mtp",
+        action="store_true",
+        default=ServerArgs.enable_mtp,
+        help=(
+            "Load the checkpoint's multi-token-prediction head for self-speculative "
+            "decoding. Off by default: it adds one decoder layer's parameters to VRAM "
+            "(~4.7 GiB of BF16 experts on Qwen3.8-Flash-Next) that nothing consumes yet."
+        ),
+    )
+    mtp_group.add_argument(
+        "--mtp-tokens",
+        type=int,
+        dest="mtp_num_tokens",
+        default=ServerArgs.mtp_num_tokens,
+        help="Draft depth for the MTP head, in tokens per speculative step.",
+    )
+
     parser.add_argument(
         "--max-prefill-length",
         "--max-extend-length",

@@ -81,6 +81,18 @@ def hf_config(
         make_ngram_vocab_size_divisible_by=8,
         split_ngram_parts=4,
         eos_token_id=EOS,
+        # the MTP draft head, released shape: one full_attention layer, no dedicated
+        # embeddings. Present in the toy config so the head is constructible; the model
+        # still needs mtp_enabled to build it.
+        mtp={
+            "hybrid": True,
+            "layer_types": ["full_attention"],
+            "mtp_use_hidden_state_from_layer": None,
+            "num_hidden_layers": 1,
+            "rope_theta": rope_theta,
+        },
+        mtp_num_hidden_layers=1,
+        mtp_use_dedicated_embeddings=False,
     )
     for name, value in text_overrides.items():
         setattr(text, name, value)
@@ -350,8 +362,11 @@ def install_quant_config(model_path: str) -> None:
     set_quant_config(checkpoint_quant_config(model_path, hf, get_model_spec(hf.architectures[0])))
 
 
-def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
-    """State dict of the model the engine builds for ``model_path`` (experts offloaded), on the meta device."""
+def meta_state_dict(model_path: str, *, enable_mtp: bool = False) -> dict[str, torch.Tensor]:
+    """State dict of the model the engine builds for ``model_path`` (experts offloaded), on the meta device.
+
+    ``enable_mtp`` mirrors EngineConfig's --enable-mtp: the MTP head is absent unless asked for.
+    """
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
     from freetoken.layers import rotary
@@ -362,7 +377,7 @@ def meta_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
     config = EngineConfig(model_path=model_path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload",
-                          mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
+                          enable_mtp=enable_mtp, mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
     object.__setattr__(config.model_config, "moe_strategy", "offload")
     object.__setattr__(config.model_config, "decode_target", _decode_target(config))
     saved = rotary._ROPE_DEVICE

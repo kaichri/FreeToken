@@ -26,6 +26,11 @@ class EngineConfig:
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
+    # Build the checkpoint's multi-token-prediction head for self-speculative decoding.
+    # Experimental, off by default; a checkpoint without a head is unaffected either way.
+    enable_mtp: bool = False
+    # Draft depth for the MTP head; clamped to the head's layer count at build time.
+    mtp_num_tokens: int = 1
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)
     # --quant-backend: layer[.kind]=kernel entries, comma separated
@@ -136,7 +141,7 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        return replace(model_config, quant=quant)
+        return replace(model_config, quant=quant, mtp_enabled=self.enable_mtp and spec.mtp_key_prefix is not None)
 
     @property
     def max_seq_len(self) -> int:

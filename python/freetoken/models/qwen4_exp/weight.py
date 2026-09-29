@@ -6,7 +6,10 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is kept only when the model built the tower.
+Kept only when the engine built it: ``mtp.*`` (the speculative head, including its stacked
+``mtp.layers.0.mlp.experts.*``) is BF16 and loads through the dense path like any other
+weight, but ``load_weight`` drops it unless the MTP head was constructed. ``model.visual.*``
+is kept only when the model built the tower.
 """
 
 from __future__ import annotations
@@ -36,8 +39,9 @@ from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
-# weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
-# stacked ``mtp.layers.N.mlp.experts.*`` tensors.
+# weight_map key in nvfp4_banks. The ``model.language_model.`` anchor keeps the MTP head's
+# stacked ``mtp.layers.N.mlp.experts.*`` tensors out of the trunk's bank; those are BF16 and
+# load as ordinary dense weights.
 _EXPERT_KEY_RE = re.compile(
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
@@ -86,14 +90,14 @@ _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith("mtp."):
-        return None
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
         return None  # routed experts: offload source banks
     if raw_name.endswith(_SCALE_SUFFIXES):
         return None
+    # ``mtp.*`` keeps its own prefix: the MTP head is a sibling of the model, not a
+    # sub-tree of it. load_weight drops it unless the engine built the head.
     return rename_vl_prefix(raw_name)
 
 

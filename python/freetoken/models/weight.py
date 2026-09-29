@@ -209,6 +209,7 @@ def load_weight(
     *,
     include_moe_experts: bool = True,
     include_vision: bool = True,
+    include_mtp: bool = True,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -218,12 +219,12 @@ def load_weight(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
     from freetoken.models.config import VISION_KEY_PREFIXES
 
+    _config, spec = _spec_for_model_path(model_path)
     # a text-only engine never built the tower, so its tensors are not even read
     keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
     if is_ftw_checkpoint(model_path):
         weights = iter_ftw_weights(model_path, keep=keep)
     else:
-        _config, spec = _spec_for_model_path(model_path)
         iter_weights = _load_attr(spec.module, spec.iter_weights)
         # only a family that registers an encoder is asked about the tower; the others never load one
         kwargs = {"include_vision": include_vision} if spec.encoders else {}
@@ -234,7 +235,12 @@ def load_weight(
             include_non_moe=True,
             **kwargs,
         )
+    # the MTP head is optional: without --enable-mtp the model has no module for these
+    # keys, and load_state_dict rejects the leftovers.
+    mtp_prefix = spec.mtp_key_prefix
     for name, tensor in weights:
+        if mtp_prefix and not include_mtp and name.startswith(mtp_prefix):
+            continue
         if keep is not None and not keep(name):
             continue
         yield name, tensor
