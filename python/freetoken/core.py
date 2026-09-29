@@ -122,6 +122,10 @@ class Batch:
     # [3, n] t/h/w rope positions on mrope models; positions keeps its sequence-index meaning for token_pool / page_table
     mrope_positions: torch.Tensor | None = field(default=None, init=False)
     out_loc: torch.Tensor | None = field(init=False)
+    # (token_index, positions) H2D mapping from the scheduler's _make_input_tuple. Held on the
+    # batch so a forward can re-read the token pool through it; the pool is rewritten between
+    # forwards, so the index has to be re-read rather than captured once.
+    input_index: tuple | None = field(default=None, init=False)
     # Per-(padded-)request table_idx as a GPU int64 tensor, used by GatedDeltaNet
     # decode to gather/scatter recurrent+conv state without host-side loops (so the
     # decode step is CUDA-graph capturable). Set by the scheduler / graph buffer.

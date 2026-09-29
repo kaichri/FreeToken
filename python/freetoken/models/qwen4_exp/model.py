@@ -157,6 +157,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         self.mtp: Qwen4ExpMTP | None = None
         if config.mtp_enabled and config.qwen4_args.mtp_num_hidden_layers > 0:
             self.mtp = Qwen4ExpMTP(_mtp_config(config))
+        # one-shot pre-mixer capture for priming the head's window; see
+        # capture_pre_mixer_tail. None on the normal path.
+        self._pre_mixer_tail_rows: int | None = None
+        self._pre_mixer_tail: torch.Tensor | None = None
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
@@ -227,9 +231,52 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         return table.bank.nbytes
 
     def forward(self) -> torch.Tensor:
+        return self.forward_with_residual()[0]
+
+    def capture_pre_mixer_tail(self, rows: int) -> None:
+        """Arm a one-shot capture of the last ``rows`` pre-mixer residuals.
+
+        Priming the MTP window needs the residual of the position *before* each token it writes,
+        and those come out of the prefill -- but the prefill is a plain ``forward``, which drops
+        them. Re-deriving them would mean a second trunk forward over the prompt.
+
+        Armed only around the prefill that primes a window, and disarms itself on the next
+        forward, so the normal path pays one identity check and nothing else. The buffer is
+        bounded by ``rows``, which the caller sizes to the head's window.
+        """
+        self._pre_mixer_tail_rows = rows
+        self._pre_mixer_tail = None
+
+    @property
+    def pre_mixer_tail(self) -> torch.Tensor | None:
+        """The captured residuals, or None if no capture ran."""
+        return self._pre_mixer_tail
+
+    def forward_with_residual(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Logits, plus the pre-mixer residual the MTP head is conditioned on.
+
+        The speculative round needs the residual and the normal path does not, so it is returned
+        rather than recomputed: deriving it again would mean a second trunk forward.
+
+        The lm head collapses a varlen batch to its last token per request, which is right for
+        prefill and wrong for a speculative verify: that caller needs a chosen row, not the
+        last one. ``is_verify`` therefore keeps every row, and the verify forward indexes the
+        row it wants.
+        """
         batch = get_global_ctx().batch
-        collapsed, _pre_mixer = self.model.forward(batch.input_ids, batch)
-        return self.lm_head.forward(collapsed)
+        collapsed, pre_mixer = self.model.forward(batch.input_ids, batch)
+        tail_rows = self._pre_mixer_tail_rows
+        if tail_rows is not None:
+            # one-shot: a slice plus a copy of at most `rows` rows, the prompt forward's own
+            # residual, which is already materialised and would otherwise be freed here
+            self._pre_mixer_tail = pre_mixer[-tail_rows:].clone()
+            self._pre_mixer_tail_rows = None
+        if batch.is_verify:
+            # the head would slice to the last token per request; keep the full [T, vocab]
+            logits = self.lm_head.forward_all(collapsed)
+        else:
+            logits = self.lm_head.forward(collapsed)
+        return logits, pre_mixer
 
     def mtp_logits(self, input_ids: torch.Tensor, pre_mixer_residual: torch.Tensor, batch: Batch) -> torch.Tensor:
         """The MTP head's next-token logits, reusing the trunk's embedding and lm_head.

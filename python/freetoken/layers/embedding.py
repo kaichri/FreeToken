@@ -126,14 +126,23 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if not batch.is_decode:
-            # varlen: one row per request, the last token of its chunk. For a verify chunk
-            # that is the drafted token's row, which is the distribution the draft is
-            # checked against.
+        if not batch.is_decode and not batch.is_verify:
+            # varlen: one row per request, the last token of its chunk. A verify chunk must not
+            # be collapsed -- its caller indexes a chosen row, not the last one.
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
+        return self.forward_all(x)
 
+    def forward_all(self, x: torch.Tensor) -> torch.Tensor:
+        """Logits for every row of ``x``, with no per-request collapse.
+
+        Split out of :meth:`forward` so a speculative verify can ask for a specific row of a
+        chunk; the TP all-gather below is shared, so both paths cost the same.
+        """
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        bs = batch.size
         if self.tied_embedding is not None:
             logits = F.linear(x, self.tied_embedding.weight, self.bias)
         else:

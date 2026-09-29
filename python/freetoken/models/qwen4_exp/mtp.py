@@ -137,20 +137,55 @@ class Qwen4ExpMTP(BaseOP):
         """Collapse the pre-mixer residual to ``[T, hidden]`` for the shared lm_head."""
         return self.hyper_connection_mixer.mix(residual)[0]
 
-    def draft_logits(
+    def prime_window(
+        self,
+        slot: int,
+        embedded: torch.Tensor,
+        target_residual: torch.Tensor,
+        positions: torch.Tensor,
+        mrope_positions: torch.Tensor | None = None,
+    ) -> int:
+        """Fill the head's window over ``positions`` in one forward, and return the row count.
+
+        The reference is the Phase-0 prober's ``prime``: row ``t`` is the head's own forward for
+        the token at position ``t`` against the residual of position ``t-1``, over the whole
+        chunk at once. Those rows are what the first draft attends over, and without them the
+        head sees an empty window -- it answers from a prior instead of the context, and every
+        draft comes out the same token regardless of the prompt.
+
+        The mixer and the lm_head are skipped: priming only has to write the layer's KV, and
+        the [rows, vocab] matmul would be pure cost. A draft reads its own logits.
+        """
+        count = int(positions.shape[0])
+        if count == 0:
+            return 0
+        batch = self.kv.reserve(
+            [(slot, count)], positions, mrope_positions, phase="prefill"
+        )
+        with self.kv.draft(batch):
+            self.layers.op_list[0].forward(self.fuse(embedded, target_residual), batch)
+        return count
+
+    def draft_hidden(
         self, embedded: torch.Tensor, target_residual: torch.Tensor, head_batch
     ) -> torch.Tensor:
-        """Draft next-token logits against the head's own KV window.
+        """The head's collapsed hidden for the drafted positions, against its own KV window.
+
+        This is *not* vocabulary logits: like :meth:`logits` it hands back the ``[T, hidden]``
+        tensor, and the shared ``lm_head`` is the trunk's, so the caller applies it. Naming it
+        ``hidden`` is deliberate -- a caller that takes the argmax over this tensor directly
+        ranks hidden dimensions instead of tokens, which yields a near-constant draft that
+        looks like a broken head rather than a wiring mistake.
 
         ``head_batch`` comes from :meth:`MtpKV.reserve`, so its rows are already claimed in
-        the window. The whole forward runs inside the window's context swap, which is what
-        keeps the head's attention off the trunk's paged backend.
+        the window. The caller must run this inside ``head_batch``'s own
+        :meth:`MtpKV.draft` context, because the shared ``lm_head`` it feeds reads the active
+        batch, and the swap has to still be in place when the projection runs.
         """
-        with self.kv.draft(head_batch):
-            hidden = self.layers.op_list[0].forward(
-                self.fuse(embedded, target_residual), head_batch
-            )
-            return self.logits(hidden)
+        hidden = self.layers.op_list[0].forward(
+            self.fuse(embedded, target_residual), head_batch
+        )
+        return self.logits(hidden)
 
 
 def mtp_state_bytes(head: Qwen4ExpMTP) -> int:

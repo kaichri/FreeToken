@@ -7,6 +7,7 @@ still attends to exactly the same keys it held before.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from freetoken.models.qwen4_exp.mtp_kv import MTP_KV_WINDOW, MTP_LAYER_ID, MtpKV
@@ -128,3 +129,36 @@ def test_reset_clears_every_slot():
     assert kv.live_rows(0) == 0 and kv.live_rows(1) == 0
     k, v = kv.backend.kv(MTP_LAYER_ID)
     assert k.abs().sum().item() == 0.0 and v.abs().sum().item() == 0.0
+
+
+def test_reset_slot_leaves_the_others_alone():
+    """A retired request's slot has to be clean without disturbing a live one.
+
+    The live count is the part that would bite: a slot handed to the next request still counting
+    the previous one's rows would prime that request's attention with a foreign window.
+    """
+    kv = _kv(num_slots=2, window=8)
+    kv.reserve([(0, 2), (1, 3)], _pos(5))
+    k, v = kv.backend.kv(MTP_LAYER_ID)
+    k[1].fill_(2.0)
+    v[1].fill_(3.0)
+    kv.reset_slot(0)
+    assert kv.live_rows(0) == 0
+    assert kv.live_rows(1) == 3, "resetting one slot must not touch another"
+    assert k[0].abs().sum().item() == 0.0 and v[0].abs().sum().item() == 0.0
+    assert k[1].eq(2.0).all() and v[1].eq(3.0).all(), "the other slot's rows were zeroed"
+    with pytest.raises(IndexError):
+        kv.reset_slot(2)
+
+
+def test_reserve_takes_the_phase_of_the_forward_it_feeds():
+    """A multi-row priming chunk has to reach the prefill branches, a draft the decode one."""
+    kv = _kv(num_slots=1, window=8)
+    primed = kv.reserve([(0, 4)], _pos(4, 10), phase="prefill")
+    assert primed.is_prefill and not primed.is_decode
+    assert primed.padded_reqs[0].cached_len == 0 and primed.padded_reqs[0].extend_len == 4
+    draft = kv.reserve([(0, 1)], _pos(1, 14))
+    assert draft.is_decode
+    # the absolute positions travel with the batch; only the row slots are window-relative
+    assert draft.get_attn_positions().tolist() == [14]
+    assert primed.get_attn_positions().tolist() == [10, 11, 12, 13]

@@ -64,6 +64,9 @@ class MtpDraftBatch:
 
     padded_reqs: list[MtpWindowReq]
     positions: torch.Tensor
+    # mrope models feed the rotary [3, n] rope rows (rotary.py:179 asserts dim 2), so the head
+    # carries the same shape the trunk gives it
+    mrope_positions: torch.Tensor | None = None
     phase: str = "decode"
     size_: int = field(default=0, init=False)
 
@@ -87,6 +90,10 @@ class MtpDraftBatch:
         return self.size_
 
     def get_attn_positions(self) -> torch.Tensor:
+        # same precedence as Batch.get_attn_positions (core.py): the 3-axis rope rows when
+        # present, else the sequence index
+        if self.mrope_positions is not None:
+            return self.mrope_positions
         return self.positions
 
 
@@ -123,16 +130,26 @@ class MtpKV:
         n = self._live[slot]
         return k[slot, :n], v[slot, :n]
 
-    def reserve(self, rows: list[tuple[int, int]], positions: torch.Tensor) -> MtpDraftBatch:
+    def reserve(
+        self,
+        rows: list[tuple[int, int]],
+        positions: torch.Tensor,
+        mrope_positions: torch.Tensor | None = None,
+        *,
+        phase: str = "decode",
+    ) -> MtpDraftBatch:
         """Claim ``n`` rows for each ``(slot, n)``, rolling the window when it would overflow.
 
         The rows are claimed before the forward writes them, so the window length is exact
         even if the forward is later rejected and rolled back by the caller.
+
+        ``phase`` is the head's own: a multi-row priming chunk has to reach the attention and
+        MoE prefill branches, which a one-row draft does not.
         """
         reqs: list[MtpWindowReq] = []
         for slot, n in rows:
             if not 0 <= slot < self.num_slots:
-                raise IndexError(f"MTP window slot {slot} outside 0..{self.num_slots - 1}")
+                raise IndexError(f"MTP window slot {slot} outside 0..{self.num_slots}")
             live = self._live[slot]
             if live + n > self.window:
                 self._roll(slot, min(live, self.window - n))
@@ -140,7 +157,9 @@ class MtpKV:
             assert live + n <= self.window, "window too small for this draft"
             self._live[slot] = live + n
             reqs.append(MtpWindowReq(table_idx=slot, cached_len=live, extend_len=n))
-        return MtpDraftBatch(padded_reqs=reqs, positions=positions)
+        return MtpDraftBatch(
+            padded_reqs=reqs, positions=positions, mrope_positions=mrope_positions, phase=phase
+        )
 
     def _roll(self, slot: int, keep: int) -> None:
         """Drop the oldest rows so ``keep`` recent ones stay, keeping their rope baked in.
@@ -162,6 +181,17 @@ class MtpKV:
         """
         self._live[slot] = max(0, self._live[slot] - rows)
 
+    def set_live(self, slot: int, rows: int) -> None:
+        """Set a slot's live row count outright, to restore a snapshot.
+
+        A rollback has to return the window to the length the snapshot recorded, not merely
+        subtract one: the two differ as soon as a draft is taken after a snapshot that already
+        held rows.
+        """
+        if not 0 <= rows <= self.window:
+            raise ValueError(f"window live count {rows} outside 0..{self.window}")
+        self._live[slot] = rows
+
     @contextmanager
     def draft(self, batch: MtpDraftBatch):
         """Run the head against its own window.
@@ -179,6 +209,19 @@ class MtpKV:
         finally:
             ctx._batch = saved_batch
             ctx.attn_backend = saved_backend
+
+    def reset_slot(self, slot: int) -> None:
+        """Forget one request's window, so the slot can be handed to the next one.
+
+        The live count is the part that matters: a slot reused with a stale count would hand the
+        next request a window of rows that belong to the previous one.
+        """
+        if not 0 <= slot < self.num_slots:
+            raise IndexError(f"MTP window slot {slot} outside 0..{self.num_slots}")
+        k, v = self.backend.kv(MTP_LAYER_ID)
+        k[slot].zero_()
+        v[slot].zero_()
+        self._live[slot] = 0
 
     def reset(self) -> None:
         for slot in range(self.num_slots):

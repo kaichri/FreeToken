@@ -1041,23 +1041,32 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
-    def forward_verify(self, batch: Batch) -> torch.Tensor:
+    def forward_verify(self, batch: Batch, token_pool: torch.Tensor) -> torch.Tensor:
         """The speculative target forward: a varlen extend of k+1 tokens per request.
 
-        Returns the [bs, vocab] logits for the LAST token of each request's chunk, i.e. the
-        distribution the drafted token is checked against. Deliberately unlike
-        ``forward_batch``: it does not call ``complete_one`` (the chunk advanced more than
-        one token, so the request must not be advanced here) and it does not sample or
-        publish a token. CUDA graphs are never used for this shape.
+        Returns the FULL ``[T, vocab]`` logits, one row per token of the chunk -- not the
+        last-token-per-request collapse the prefill path does. The caller needs a specific row:
+        for a k=1 chunk ``[y1, d1]``, row 0 is the distribution *after* y1, which is the one
+        d1 is checked against, and row 1 is the distribution after d1, the next round's free
+        first token. Collapsing to the last row would silently return the wrong one.
+
+        Deliberately unlike ``forward_batch``: it does not call ``complete_one`` (the chunk
+        advanced more than one token, so the request must not be advanced here) and it does
+        not sample or publish a token. CUDA graphs are never used for this shape.
+
+        ``token_pool`` is the scheduler's, passed in rather than read off the engine, because
+        the pool belongs to the table manager (scheduler.py:135) and forward_batch's caller
+        does the same gather.
         """
         assert torch.cuda.current_stream() == self.stream
         assert batch.is_verify
         assert not self.graph_runner.can_use_cuda_graph(batch)
+        batch.input_ids = token_pool[batch.input_index].to(torch.int32)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
             logits = self.model.forward()
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
-        return logits[: batch.size]
+        return logits
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
