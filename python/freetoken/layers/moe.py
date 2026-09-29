@@ -195,12 +195,21 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        # not is_decode, not is_prefill: a verify chunk is multi-token per request and needs
-        # the varlen expert kernels, but it is not a prefill.
-        if not ctx.batch.is_decode:
-            final_hidden_states = self.prefill_forward(hidden_states, router_logits)
-        else:
+        batch = ctx.batch
+        if batch.is_decode:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
+        elif batch.is_verify:
+            # A verify chunk is 2-4 tokens per request, so it is neither a decode nor a prefill.
+            # The expert path matters a great deal here: prefill_forward MATERIALISES whole
+            # layers (one H2D copy of every expert in the layer) and compute is varlen-packed,
+            # while decode_forward keeps the LRU slot cache and rewrites ids to slots. For a
+            # 2-token chunk the layer materialise is pure waste -- 512 experts staged to serve
+            # 20 routed ones -- and it measured 13.6x a 1-row decode rather than the ~2x the
+            # work implies. So the verify rides the decode path, which is the one that scales
+            # with the routed ids instead of the layer.
+            final_hidden_states = self.decode_forward(hidden_states, router_logits)
+        else:
+            final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         return self._maybe_all_reduce(final_hidden_states)
 
     def routed_forward(
@@ -220,10 +229,13 @@ class OffloadMoELayer(MoELayer):
         shared branches that need the original input before calling this method.
         """
         ctx = get_global_ctx()
-        if not ctx.batch.is_decode:
-            out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
-        else:
+        batch = ctx.batch
+        # a verify chunk is multi-token but tiny, so it takes the decode path for the same
+        # reason as forward(): the slot cache, not a whole-layer materialise
+        if batch.is_decode or batch.is_verify:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
+        else:
+            out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
 
     def decode_forward(
@@ -316,6 +328,8 @@ class OffloadMoELayer(MoELayer):
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
+        # before ensure_experts rewrites them to slot ids, for the per-layer unique count
+        cache.note_routed_ids(self.layer_id, raw)
         cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)

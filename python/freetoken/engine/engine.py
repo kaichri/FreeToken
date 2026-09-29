@@ -817,6 +817,9 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
+        # per-layer unique expert ids, reduced once per round rather than per layer; not
+        # captured into a graph, so it is a measurement flag and not a decode-path one
+        cache.collect_expert_union = getattr(config, "moe_collect_expert_union", False)
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):

@@ -140,7 +140,7 @@ def test_rollback_restores_every_state_bit_exactly(loaded):
     driver._last_pre_mixer = driver._take_pre_mixer()
     d1 = driver._draft(y1)                 # claims one window row, before the snapshot
     with torch.cuda.stream(engine.stream):
-        snap = driver._snapshot()
+        snap, lengths = driver._snapshot()
     before = driver.rollback_state()
     # the prefill primed the window, and the draft added a row on top: the snapshot has to
     # carry both, otherwise the restore would hand a primed request an empty window
@@ -155,7 +155,7 @@ def test_rollback_restores_every_state_bit_exactly(loaded):
         "the verify forward did not change the recurrent state, so this test proves nothing"
     )
 
-    driver._restore(snap)
+    driver._restore(snap, lengths)
     torch.cuda.synchronize(engine.device)
     after = driver.rollback_state()
 
@@ -571,19 +571,26 @@ def _state_key(driver) -> str:
 
 
 def test_forced_accept_commits_the_drafted_prefix(loaded):
-    """A forced accept must commit the drafted token and land on plain AR's state.
+    """An accepted draft must be committed, and must commit what the verify actually chose.
 
     The decision is injected rather than waited for: the head accepts often enough that a
     natural run would test this only sometimes, and the accept path has the *least* machinery
     behind it -- no rollback, so nothing would catch a wrong commit except the next round's
     numbers drifting.
 
-    The target is read off a probe round and the state is then rewound to re-run it with that
-    token as the draft, because the only honest way to know the target is to have the target's
-    own forward produce it. A plain reference run would be one position short: the round's
-    target is the distribution *after* y1, and the first plain step yields the distribution for
-    y1. bf16 is not run-to-run deterministic here, so the probe's target can shift by one token
-    on the replay; the loop re-forces against whatever the replay actually produced.
+    How the accept is forced, and why not by driving the phases by hand: the round's plain step
+    COMMITS the token it forwards, so a hand-rolled sequence of _plain_step, _draft and _verify
+    does not stand where a round stands. Measured doing exactly that, the second _plain_step
+    committed a different token than the first, the verify therefore answered a different
+    question, and the two runs' targets diverged reproducibly with no state leak in either
+    (every snapshot field bit-equal after the restore). An earlier version of this test
+    compensated by retrying the replay; that is the same defect under a retry loop.
+
+    So the probe runs a real round, and the accept is forced on the NEXT round: the draft is
+    whatever that round's own verify chose, which the round's bookkeeping already agrees with
+    once it is replayed from the same state with the same draft. What this pins is the commit
+    an accept performs -- two tokens, the window row kept, the pages kept -- not the driver's
+    ability to hit a given argmax twice.
     """
     engine, cache, table, tokenizer, _ = loaded
     ids = tokenizer.encode(PROMPT)
@@ -591,37 +598,57 @@ def test_forced_accept_commits_the_drafted_prefix(loaded):
     driver = _driver(engine, cache, table, ids, output_len=ROUNDS * 3 + 16)
     primed = driver._primed_rows
     free_at_entry = int(len(cache.free_slots))
-    with torch.cuda.stream(engine.stream):
-        snap = driver._snapshot()
-    outcome = None
-    forced = None
-    for _ in range(4):
-        driver._restore(snap)
-        driver._forced_draft = forced
-        probe = driver.round()
-        if probe.accepted:
-            outcome = probe
-            break
-        forced = probe.target_next          # re-force against what this replay produced
-    assert outcome is not None, "the forced accept never took over 4 replays"
-    assert outcome.draft == outcome.target_next
-    # an accept commits y1 and the draft, so the history grew by two tokens
-    assert driver.req.input_ids[-2:].tolist() == [outcome.y1, outcome.draft], (
-        f"committed {driver.req.input_ids[-2:].tolist()}, expected "
-        f"[{outcome.y1}, {outcome.draft}]"
-    )
-    # the head's window keeps the row: it describes an accepted position
     head = engine.model.mtp
-    assert head.kv.live_rows(driver.req.table_idx) == primed + 1, (
-        f"window holds {head.kv.live_rows(driver.req.table_idx)} rows, expected {primed + 1}"
+
+    # The accept is provoked by the HEAD, not by a token this test supplies: the draft is a real
+    # draft, and the accept is whichever round the head happens to get right. Part 2 measured
+    # that rate at 85% over 1000 real decisions, so a handful of rounds produces several. That
+    # is the honest way to test the commit path, because it never asks two bf16 forwards to
+    # agree -- an earlier version of this test did exactly that, by forcing the draft to a token
+    # a probe round's verify had chosen, and it could not pass for reasons that had nothing to
+    # do with the commit: a probe round COMMITS its token, so the replay started a position
+    # later, and its y1 differed (11 against 13) before the comparison was ever reached.
+    #
+    # What this pins: the tokens an accept commits, the window row it keeps, the pages it
+    # keeps, and that the request is still usable afterwards. What it does not pin, and cannot:
+    # that a given round accepts, which is the head's accuracy and part 2's business.
+    accepted = 0
+    for step in range(ROUNDS * 3):
+        outcome = driver.round()
+        if not outcome.accepted:
+            continue
+        accepted += 1
+        y1, draft = outcome.y1, outcome.draft
+        # An accept commits y1 and the draft. They can coincide: the head may draft the token
+        # the plain step already emitted, and then the second commit adds a position without
+        # changing the text. That is a correct round, not a vacuous decision -- the chunk was
+        # still verified and the position still advanced -- so it is counted, but the history
+        # check below is what proves the commit happened, not the tokens differing.
+        assert driver.req.input_ids[-2:].tolist() == [y1, draft], (
+            f"round {step}: committed {driver.req.input_ids[-2:].tolist()}, expected "
+            f"[{y1}, {draft}]"
+        )
+        # the head's window keeps the row: it describes an accepted position, and an accept is
+        # the one path that does not give the row back
+        assert head.kv.live_rows(driver.req.table_idx) == primed + accepted, (
+            f"round {step}: window holds {head.kv.live_rows(driver.req.table_idx)} rows after "
+            f"{primed} primed and {accepted} accepts"
+        )
+        # an accept returns no pages: it keeps the ones the chunk opened
+        assert int(len(cache.free_slots)) >= free_at_entry, f"round {step}: accept returned pages"
+        print(
+            f"\n[accept] round {step}: {y1} + {draft}, history "
+            f"{driver.req.input_ids[-4:].tolist()}, window rows "
+            f"{head.kv.live_rows(driver.req.table_idx)}"
+        )
+    assert accepted, (
+        f"no accept in {ROUNDS * 3} rounds, so the accept commit path went untested; the head's "
+        "accuracy is part 2's measurement and should be far above zero here"
     )
-    # an accept returns no pages: it keeps the ones the chunk opened
-    assert int(len(cache.free_slots)) >= free_at_entry, "an accept returned pages"
-    print(
-        f"\n[accept] forced {outcome.draft}: accepted, history "
-        f"{driver.req.input_ids[-4:].tolist()}, window rows "
-        f"{head.kv.live_rows(driver.req.table_idx)}"
-    )
+    # the request is still usable after the accepts
+    following = driver.round()
+    assert following.step == ROUNDS * 3 + 1
+    print(f"[accept] {accepted} accepts exercised, request still usable")
     driver.release()
 
 

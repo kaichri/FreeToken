@@ -141,7 +141,7 @@ def plain_vs_plain_baseline(driver, repeats: int = 4) -> dict:
     engine = driver.engine
     pool = engine.linear_state_pool
     with torch.cuda.stream(engine.stream):
-        snap = driver._snapshot()
+        snap, snap_lengths = driver._snapshot()
     rows: list[torch.Tensor] = []
     try:
         for _ in range(repeats):

@@ -222,6 +222,11 @@ class OffloadMoeCache:
         # must be enabled before capture — see engine graph setup). The only graph artifact
         # is a one-off warm-up increment at capture time (<0.1% over a session).
         self.collect_stats = False
+        # per-layer UNIQUE expert counts for the verify-vs-target question. Off by default;
+        # when on, the decode path keeps each layer's raw routed ids and expert_union()
+        # reduces them once per round instead of once per layer.
+        self.collect_expert_union = False
+        self.union_records: list = []
         # [num_layers, N_STATS] -- ensure_experts passes lru_stats[layer_id] straight to
         # the kernel, which accumulates in the same launch. The stat_* tensors below stay
         # for the hybrid path, whose kernel is still ours.
@@ -924,6 +929,44 @@ class OffloadMoeCache:
         self.stat_fetched_layer[layer_id] += fetched
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
+
+    def note_routed_ids(self, layer_id: int, raw: torch.Tensor) -> None:
+        """Keep this layer's raw routed expert ids, for the per-layer UNIQUE count.
+
+        The active count is tokens * top_k, which cannot answer whether a second row routes
+        to experts the first row already pulled in -- and that question is the whole point of
+        a 2-row verify. The caller is the layer's decode path, which is the only place the raw
+        ids exist before they are rewritten to slot ids.
+
+        Off by default. When on, this appends a reference per layer per step; the reduction to
+        uniques happens once in :meth:`expert_union`, not here, so the hot path stays free of
+        per-layer work and of any host sync.
+        """
+        if not self.collect_expert_union:
+            return
+        self.union_records.append((layer_id, raw.clone()))
+
+    def expert_union(self) -> dict:
+        """Per-layer unique expert ids over the ids taken since the last reset.
+
+        One host sync for the whole batch, not one per layer: each layer's tensor is reduced
+        on the device and the counts come back together.
+        """
+        if not self.union_records:
+            return {}
+        totals = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
+        for layer_id, raw in self.union_records:
+            if raw.numel():
+                vals = raw[raw >= 0]
+                if vals.numel():
+                    totals[layer_id] += int(torch.unique(vals).numel())
+        self.union_records.clear()
+        counts = totals.tolist()
+        return {
+            "unique_per_layer": counts,
+            "sum_unique": int(sum(counts)),
+            "max_unique": int(max(counts)) if counts else 0,
+        }
 
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":

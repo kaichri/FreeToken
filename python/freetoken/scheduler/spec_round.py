@@ -205,7 +205,7 @@ class SpeculativeRoundDriver:
         # 2. snapshot the post-step state. Taken before the verify forward overwrites it. On the
         #    engine stream, so it is ordered against the verify's writes rather than racing them.
         with torch.cuda.stream(self.engine.stream):
-            snap = self._snapshot()
+            snap, snap_lengths = self._snapshot()
 
         # 3. the draft, against the head's own window. It claims a window row, which a reject
         #    has to give back -- so the claim exists before the verify, and the snapshot above is
@@ -239,7 +239,7 @@ class SpeculativeRoundDriver:
         if accepted:
             self._commit_draft(d1)
         else:
-            self._rewind_after_reject(snap, target_next)
+            self._rewind_after_reject(snap, target_next, snap_lengths)
 
         self._steps += 1
         return DraftOutcome(
@@ -394,7 +394,9 @@ class SpeculativeRoundDriver:
         self._verify_pages = None
         self._draft_row_slot = None
 
-    def _restore(self, snap: int) -> None:
+    def _restore(
+        self, snap: int, lengths: tuple[int, int] | None = None
+    ) -> None:
         """Put the request back to the snapshot, on the engine stream.
 
         Everything a rejected draft claimed has to go back, not just the recurrent state:
@@ -405,6 +407,16 @@ class SpeculativeRoundDriver:
         Split out of :meth:`_rewind_after_reject` so a test can compare the restored state
         against the snapshot before the re-forward overwrites it again -- that comparison is the
         local rollback proof, and it does not depend on any forward's numerics.
+
+        The scalar bookkeeping is read off the snapshot the caller NAMES, not off whatever
+        ``self._snap_*`` happens to hold. The driver keeps one snapshot for its life, so
+        ``_restore(snap)`` and ``_snapshot()`` are a matched pair today -- but a caller that
+        replays a state (a test forcing a decision, say) holds two, and reading the lengths out
+        of the wrong one silently hands the request a different position than the state it just
+        restored. Measured doing exactly that: the state came back bit-exact while ``cached_len``
+        came back one position ahead, so the next forward computed a different chunk and the
+        verify named a different token. Hence ``lengths`` is a parameter, and a caller that
+        replays passes the pair it snapshotted with.
 
         The stream context is load-bearing. ``copy_from`` is a plain torch op, so it lands on
         whichever stream is current at the call site; if that is the scheduler's stream while
@@ -430,12 +442,15 @@ class SpeculativeRoundDriver:
         head = engine.model.mtp
         if self._snap_window_live is not None and head is not None and head._kv is not None:
             head.kv.set_live(self._window_slot(), self._snap_window_live)
-        if self._snap_lengths is not None:
-            req.cached_len, req.device_len = self._snap_lengths
+        cached_len, device_len = lengths if lengths is not None else self._snap_lengths
+        if cached_len is not None:
+            req.cached_len, req.device_len = cached_len, device_len
             req.input_ids = req._ids_buf[: req.device_len]
         self._draft_row_slot = None
 
-    def _rewind_after_reject(self, snap: int, target_next: torch.Tensor) -> None:
+    def _rewind_after_reject(
+        self, snap: int, target_next: torch.Tensor, lengths: tuple[int, int] | None = None
+    ) -> None:
         """Return to the state plain AR would hold after ``y1``, then commit the re-forward's
         own sample.
 
@@ -447,7 +462,7 @@ class SpeculativeRoundDriver:
         """
         engine = self.engine
         req = self.req
-        self._restore(snap)
+        self._restore(snap, lengths)
         with torch.cuda.stream(engine.stream):
             batch = self._build_batch("decode")
             logits = self._forward(batch)
@@ -820,8 +835,11 @@ class SpeculativeRoundDriver:
 
     # ------------------------------------------------------------------ bookkeeping
 
-    def _snapshot(self) -> int:
-        """Copy the request's live state into the spare slot and return that slot.
+    def _snapshot(self) -> tuple[int, tuple[int, int]]:
+        """Copy the request's live state into the spare slot; return ``(slot, lengths)``.
+
+        The lengths travel with the slot so a caller that replays this state can hand them back
+        to :meth:`_restore`; see that method for what goes wrong otherwise.
 
         The copy is the point: the verify's kernels overwrite conv, recurrent and both PLE
         states in place and keep no previous value, so the only way back is a copy taken before
@@ -854,7 +872,7 @@ class SpeculativeRoundDriver:
         # own unwind, so recording them costs nothing there and lets a caller return to a point
         # before the round at all.
         self._snap_lengths = (req.cached_len, req.device_len)
-        return self._snap_slot
+        return self._snap_slot, self._snap_lengths
 
     def _take_pre_mixer(self) -> torch.Tensor:
         assert self._residual is not None, "no trunk forward has run"
