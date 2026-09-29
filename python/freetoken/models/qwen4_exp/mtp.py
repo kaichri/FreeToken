@@ -36,6 +36,7 @@ from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearReplicated, OPLi
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual, GroupedPlusOneRMSNorm
 from .moe import Qwen4ExpMoE
+from .mtp_kv import MTP_KV_WINDOW, MTP_LAYER_ID, MtpKV
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -53,7 +54,7 @@ class Qwen4ExpMTPDecoderLayer(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, *, prefix: str) -> None:
-        self.self_attn = Qwen4ExpAttention(config, 0, prefix=f"{prefix}.self_attn")
+        self.self_attn = Qwen4ExpAttention(config, MTP_LAYER_ID, prefix=f"{prefix}.self_attn")
         self.mlp = Qwen4ExpMoE(config, prefix=f"{prefix}.mlp")
         self.attn_hyper_connection = GatedResidual(config, prefix=f"{prefix}.attn_hyper_connection")
         self.mlp_hyper_connection = GatedResidual(config, prefix=f"{prefix}.mlp_hyper_connection")
@@ -75,6 +76,7 @@ class Qwen4ExpMTP(BaseOP):
 
     def __init__(self, config: ModelConfig, *, prefix: str = MTP_KEY_PREFIX.rstrip(".")) -> None:
         args = config.qwen4_args
+        self._config = config
         self.hidden_size = args.hidden_size
         self.hc_count = args.hc_count
         # zero-centered checkpoint weights, (1+w) applied in fp32 at runtime: same
@@ -97,6 +99,22 @@ class Qwen4ExpMTP(BaseOP):
         self.hyper_connection_mixer = GatedResidual(
             config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer"
         )
+        # private so BaseOP's state_dict/load_state_dict skip it: this is runtime scratch,
+        # not a checkpoint tensor. Built on first use because the model is constructed on the
+        # meta device, before the engine fixes the device and the request count.
+        self._kv: MtpKV | None = None
+
+    def ensure_kv(self, num_slots: int, *, device: torch.device, dtype: torch.dtype) -> MtpKV:
+        """The head's KV window, created on first use and reused afterwards."""
+        kv = self._kv
+        if kv is None or kv.num_slots != num_slots or kv.window < MTP_KV_WINDOW:
+            kv = self._kv = MtpKV(self._config, num_slots, device=device, dtype=dtype)
+        return kv
+
+    @property
+    def kv(self) -> MtpKV:
+        assert self._kv is not None, "call ensure_kv() before the head's KV is used"
+        return self._kv
 
     def fuse(self, embedded: torch.Tensor, target_residual: torch.Tensor) -> torch.Tensor:
         """The additive merge of the trunk's token embedding and the pre-mixer residual.
@@ -118,6 +136,21 @@ class Qwen4ExpMTP(BaseOP):
     def logits(self, residual: torch.Tensor) -> torch.Tensor:
         """Collapse the pre-mixer residual to ``[T, hidden]`` for the shared lm_head."""
         return self.hyper_connection_mixer.mix(residual)[0]
+
+    def draft_logits(
+        self, embedded: torch.Tensor, target_residual: torch.Tensor, head_batch
+    ) -> torch.Tensor:
+        """Draft next-token logits against the head's own KV window.
+
+        ``head_batch`` comes from :meth:`MtpKV.reserve`, so its rows are already claimed in
+        the window. The whole forward runs inside the window's context swap, which is what
+        keeps the head's attention off the trunk's paged backend.
+        """
+        with self.kv.draft(head_batch):
+            hidden = self.layers.op_list[0].forward(
+                self.fuse(embedded, target_residual), head_batch
+            )
+            return self.logits(hidden)
 
 
 def mtp_state_bytes(head: Qwen4ExpMTP) -> int:

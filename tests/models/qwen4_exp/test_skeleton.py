@@ -388,7 +388,7 @@ def test_shared_expert_gate_fusion_matches_eager():
     with torch.device(device), torch_dtype(dtype):
         moe = Qwen4ExpMoE(config, 0)
     _fill(moe, torch.Generator(device=device).manual_seed(21), scale=0.2)
-    _fresh_ctx(_batch=SimpleNamespace(is_prefill=True))
+    _fresh_ctx(_batch=SimpleNamespace(is_prefill=True, is_decode=False))
 
     x = torch.randn(6, config.hidden_size, device=device, dtype=dtype) * 0.5
     fused = moe.forward(x.clone())

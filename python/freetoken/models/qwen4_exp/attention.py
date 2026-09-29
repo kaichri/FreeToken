@@ -199,6 +199,14 @@ class TorchDenseQSAReference:
             )
         return self._cache[layer_id]
 
+    def kv(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The ``[slot, position]`` K/V this reference keeps.
+
+        The MTP window rolls rows in place and the state-equivalence check reads them back,
+        so it needs the tensors rather than only the attention result.
+        """
+        return self._layer_cache(layer_id)
+
     def qsa_forward(
         self,
         q: torch.Tensor,
